@@ -1,7 +1,7 @@
-# 嵌入式跨平台交叉编译 Skill（观测-验证-构建）
+# 嵌入式跨平台交叉编译 Skill（环境解耦 · 二进制对齐）
 
 > 适用于 RK3568 等 **Embedded Linux 目标机** 的用户态 C/C++ 开发。  
-> 本 Skill 是静态指令，不含可执行脚本；Dockerfile 仅在目标机环境指纹确认后生成。
+> 典型环境：**双网卡宿主机** — 一卡联网装工具链，一卡直连开发板做 rsync/scp。
 
 ---
 
@@ -11,353 +11,391 @@
 |------|----------------|
 | RK3568 / ARM 板子用户态程序 | ✅ |
 | 交叉编译 + Docker 构建环境 | ✅ |
+| 双网卡 + 直连开发板 + rsync 同步 | ✅ |
 | 依赖 glibc 的动态链接可执行文件 | ✅ |
-| 裸机 / FreeRTOS / 内核驱动 | ❌（无 Docker/glibc 流程） |
-| 可完全静态链接的小工具（musl） | ⚠️ 简化流程，见 §8 |
+| 裸机 / FreeRTOS / 内核驱动 | ❌ |
+| 可完全静态链接的小工具（musl） | ⚠️ 见 §9 |
 
-用户触发词：`交叉编译`、`Docker 环境`、`RK3568 构建`、`部署到板子`、`ldd not found`。
+用户触发词：`交叉编译`、`Docker 环境`、`RK3568 构建`、`部署到板子`、`ldd not found`、`sync_sysroot`。
 
 ---
 
 ## 2. 核心原则
 
-1. **观测先于构建**：Dockerfile 必须来自目标机实测，禁止凭猜测选 Ubuntu 版本或 apt 包。
-2. **需求共识先于 Dockerfile**：未明确目标板型号、部署路径、链接方式前，不写 Dockerfile。
-3. **一次验证闭环**：每次环境变更后，必须重新 `scp` → 目标机 `ldd` → 确认无 `not found`。
-4. **精准同步**：专有库优先官方 SDK/deb；仅对无法 apt 安装的库做 **rsync 单路径** 同步，禁止全量 rootfs 拷贝。
+**环境解耦与二进制对齐** — 编译器来自宿主机 apt，运行时库来自目标机 rsync，二者不得混用。
+
+| 原则 | 说明 |
+|------|------|
+| 工具链与运行库分离 | 宿主机 apt **仅**安装 `gcc-aarch64-linux-gnu` 等 **x86→ARM 交叉编译器**；ARM64 运行库 **禁止**通过宿主机/Docker apt 拉取 |
+| 二进制同源 | Sysroot 必须来自**实际运行目标板**，保证 glibc、libstdc++、厂商 .so 与板上完全一致 |
+| 分层构建 | 联网阶段装工具链 → 离线阶段 rsync sysroot → 镜像 COPY 植入 |
+| 闭环验证 | 产物上板 `ldd` 无 `not found` 后方可宣称环境就绪 |
 
 ---
 
-## 3. 强制 Pipeline（观测-验证-构建）
+## 3. 网络架构（双网卡 + 直连）
 
 ```text
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────────┐
-│ 0. Grill    │───►│ 1. 基准编译   │───►│ 2. 环境指纹  │───►│ 3. Dockerfile │
-│ 需求共识     │    │ + scp 传输   │    │ 目标机采集   │    │ + 容器内重编  │
-└─────────────┘    └──────────────┘    └─────────────┘    └──────────────┘
-                                              │                    │
-                                              └──── 4. 再验证 ◄────┘
+┌─────────────────────────────────────────────────────────────┐
+│  宿主机 / 虚拟机                                              │
+│  ┌──────────────┐          ┌──────────────┐                 │
+│  │ eth0 / 外网   │  联网   │ eth1 / 板卡网 │  直连           │
+│  │ (apt 工具链)  │ ──────► │ (rsync/scp)  │ ──────► 开发板   │
+│  └──────────────┘          └──────────────┘                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| 网卡 | 用途 | 允许操作 |
+|------|------|----------|
+| 外网网卡 | 第一阶段联网 | `apt` 安装 **宿主机架构** 的交叉工具链、`cmake`、`rsync` |
+| 板卡直连网卡 | 第二、五阶段 | `rsync`、`scp`、`ssh` 与开发板通信 |
+
+**硬性规则**：
+
+- **禁止**在宿主机或 Dockerfile 中通过 `apt install libxxx:arm64`、`qemu-user-static` 等方式拉取 ARM64 运行库 — 实测常因镜像源、架构混装、glibc 版本漂移导致交叉编译失败或板上 `ldd` 报错。
+- 板卡 IP 走直连网段（如 `192.168.1.x`），rsync/scp 命令必须显式指定 `-e "ssh -b <板卡网卡IP>"` 或路由到直连接口，避免流量误走外网网卡。
+
+---
+
+## 4. 强制 Pipeline（三阶段 + 验证）
+
+```text
+┌──────────────┐    ┌──────────────────┐    ┌──────────────┐    ┌──────────────┐
+│ 0. Grill     │───►│ 1. 联网装工具链   │───►│ 2. rsync     │───►│ 3. Docker    │
+│ 需求共识      │    │ (apt + 国内源)   │    │ sync_sysroot │    │ COPY sysroot │
+└──────────────┘    └──────────────────┘    └──────────────┘    └──────────────┘
+                                                                        │
+                    ┌───────────────────────────────────────────────────┘
+                    ▼
+              ┌──────────────┐    ┌──────────────┐
+              │ 4. CMake 构建 │───►│ 5. 上板 ldd  │
+              │ FIND_ROOT    │    │ 闭环验证      │
+              └──────────────┘    └──────────────┘
 ```
 
 ### 阶段 0 — Grill（需求共识）
 
-写 Dockerfile 或改 CMake toolchain 之前，必须确认：
+写 Dockerfile 或 `sync_sysroot.sh` 之前，必须确认：
 
-- [ ] 目标板型号与系统镜像（如 RK3568 + Debian 11 / Ubuntu 20.04 rootfs）
+- [ ] 目标板型号与系统镜像（如 RK3568 + Debian 11 / Ubuntu 20.04）
 - [ ] 目标架构（`aarch64` / `armhf`）
+- [ ] 板卡直连 IP 与 SSH 用户
+- [ ] 宿主机板卡网卡名或绑定 IP
 - [ ] 链接方式（动态 glibc / 静态 / 部分静态）
-- [ ] 部署路径与运行用户（如 `/usr/local/bin`、`root` 或普通用户）
-- [ ] 是否依赖厂商专有库（`librknn`、`librga`、`libmali` 等）
-- [ ] 主机侧现有工具链（`aarch64-linux-gnu-g++` 版本、是否已有 SDK）
+- [ ] 是否依赖厂商专有库（`librknn`、`librga`、`libmali` 等 — 随 sysroot 一并同步）
+- [ ] 部署路径与运行用户
 
 未共识时：**拒绝生成 Dockerfile**，引导用户完成 Grill 或回答上述清单。
 
 ---
 
-### 阶段 1 — 基准编译与传输
+### 阶段 1 — 联网模式：仅安装交叉工具链
 
-在**开发机或虚拟机**完成首次交叉编译（允许存在潜在库冲突，目的是获取诊断样本）：
+**仅在虚拟机/宿主机可联网时执行。** 只装 **宿主机架构** 的编译工具，不装任何 `:arm64` 包。
 
-```text
-# 配置（示例，按项目 toolchain 文件调整）
-cmake -S . -B build-arm \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-arm
-
-# 传输至目标机（替换 IP、路径、二进制名）
-scp build-arm/<your_executable> user@<board-ip>:/tmp/
-```
-
-**Agent 指令**：若用户尚未编译出二进制，引导其先完成 CMake 交叉编译配置，不要跳过此步去写 Docker。
-
----
-
-### 阶段 2 — 环境指纹提取（目标机执行）
-
-用户在目标机上执行以下命令，**完整粘贴输出**给 Agent：
+#### 1.1 注入国内 apt 镜像源（必须在 apt 之前）
 
 ```bash
-# 1. 系统与内核
-uname -a
-
-# 2. 发行版（用于锁定 Docker FROM 版本）
-cat /etc/os-release
-
-# 3. GLIBC 版本
-ldd --version | head -1
-
-# 4. 可执行文件架构与动态链接器
-file /tmp/<your_executable>
-readelf -l /tmp/<your_executable> | grep -i interpreter
-
-# 5. 运行时依赖（核心）
-ldd /tmp/<your_executable>
-
-# 6. （可选）已有厂商库路径
-ls -la /usr/lib/aarch64-linux-gnu/librk* 2>/dev/null
-ls -la /usr/lib/librk* 2>/dev/null
+# 示例：Ubuntu 20.04 替换为阿里云源（按实际发行版调整 sed 模式）
+sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+sudo sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
+sudo sed -i 's|http://security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
+sudo apt-get update
 ```
 
-**Agent 拒绝条件**：若用户未提供 **§2 中至少 `uname -a`、`/etc/os-release`、`ldd --version`、`ldd ./<executable>` 四项输出**，必须拒绝编写 Dockerfile，并输出：
+Debian 用户替换 `/etc/apt/sources.list` 中 `deb.debian.org` 为国内镜像（清华、阿里云、中科大等）。**Agent 必须根据用户发行版给出对应 sed 命令，不得跳过此步。**
 
-```markdown
-## 缺少环境指纹
+#### 1.2 安装工具链（禁止 ARM64 运行库）
 
-请先在目标机执行 EMBEDDED_CROSS_COMPILE_SKILL.md §2 阶段 2 的命令，将输出完整粘贴回来。
-
-在收到指纹前，我不会生成 Dockerfile 或修改交叉编译 sysroot。
+```bash
+sudo apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    rsync \
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    binutils-aarch64-linux-gnu \
+    pkg-config
 ```
+
+**禁止安装**：`libstdc++6:arm64`、`libc6:arm64`、`libxxx-dev:arm64` 及任何带 `:arm64` 后缀的运行时/开发包。
 
 ---
 
-### 阶段 3 — 指纹分析与 Dockerfile 生成
+### 阶段 2 — 离线同步模式：`scripts/sync_sysroot.sh`
 
-Agent 收到指纹后，按以下顺序分析并产出文档（先分析表，再 Dockerfile）：
+通过 rsync 将开发板运行时库同步至宿主机 `./sysroot`，作为 Docker 构建与 CMake 的**唯一**库来源。
 
-#### 3.1 指纹解析表（必须先输出）
+#### 2.1 Sysroot 封装规则
 
-| 字段 | 从指纹中提取 | 用途 |
-|------|-------------|------|
-| `DISTRO` | `/etc/os-release` 的 `ID` + `VERSION_ID` | `FROM ubuntu:20.04` 等 |
-| `GLIBC` | `ldd --version` | 容器 glibc 必须 ≤ 目标机（见 §3.3） |
-| `ARCH` | `uname -m` / `file` | `aarch64-linux-gnu` toolchain |
-| `INTERPRETER` | `readelf` 的 interpreter 路径 | 验证 sysroot 动态链接器 |
-| `APT_PACKAGES` | 将 `ldd` 中 `.so` 映射到 apt 包名 | `apt-get install` 列表 |
-| `NOT_FOUND` | `ldd` 中 `not found` 行 | 阻塞项，必须解决后才能 Docker 化 |
-| `VENDOR_LIBS` | 非标准路径的 `.so` | rsync 或 SDK 安装 |
+| 允许同步 | 禁止同步 |
+|----------|----------|
+| `/lib/`、`/lib/aarch64-linux-gnu/` 下的 `.so*`、动态链接器、符号链接 | 全量 rootfs（`/`、`/bin`、`/etc`、`/var` 等） |
+| `/usr/lib/`、`/usr/lib/aarch64-linux-gnu/` 下的 `.so*`、`.a`（按需）、符号链接 | 可执行文件、配置文件、内核模块 |
+| `/usr/include/` 下项目所需头文件（按需，可 `--include` 过滤） | `/usr/share/doc`、locale、man |
 
-#### 3.2 `ldd` → `apt` 映射规则
+#### 2.2 脚本模板（在目标项目中创建 `scripts/sync_sysroot.sh`）
 
-对 `ldd` 输出中每个已解析的 `.so`：
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-1. 记录完整路径（如 `libpthread.so.0 => /lib/aarch64-linux-gnu/libpthread.so.0`）
-2. 在**与目标同版本的 Ubuntu/Debian** 上，用 `dpkg -S <path>` 查所属包（用户可在目标机执行后粘贴）
-3. 归纳去重为 `apt-get install` 列表，常见映射：
+# ── 配置（按 Grill 共识填写）────────────────────────────
+BOARD_USER="${BOARD_USER:-root}"
+BOARD_IP="${BOARD_IP:-192.168.1.100}"      # 板卡直连 IP
+BOARD_SSH_BIND="${BOARD_SSH_BIND:-}"         # 可选：宿主机板卡网卡绑定 IP，如 192.168.1.10
+SYSROOT_DIR="${SYSROOT_DIR:-$(cd "$(dirname "$0")/.." && pwd)/sysroot}"
+RSYNC_SSH="ssh -o StrictHostKeyChecking=accept-new"
+[[ -n "$BOARD_SSH_BIND" ]] && RSYNC_SSH="$RSYNC_SSH -b $BOARD_SSH_BIND"
 
-| ldd 库 | 典型 apt 包 |
-|--------|------------|
-| `libstdc++.so.6` | `libstdc++6` |
-| `libgcc_s.so.1` | `libgcc-s1`（Debian）/ `libgcc1`（旧 Ubuntu） |
-| `libpthread.so.0` | `libc6` |
-| `libdl.so.2` | `libc6` |
-| `libm.so.6` | `libc6` |
-| `libi2c.so.0` | `libi2c0` |
-| `libgpiod.so.2` | `libgpiod2` |
+RSYNC=(rsync -avz --copy-links --delete \
+    --include='*/' \
+    --include='*.so' --include='*.so.*' \
+    --include='ld-linux-*' --include='ld-*.so.*' \
+    --exclude='*')
 
-对 **`not found`** 库：
+REMOTE="${BOARD_USER}@${BOARD_IP}"
 
-- 标准库名 → 补充对应 `-dev` 和运行时包，重新编译后再测
-- 厂商库（`librknnrt.so`、`librga.so` 等）→ 走 §3.4，**不得**凭空写 `apt install`
+sync_path() {
+    local remote_path="$1"
+    local local_path="$2"
+    mkdir -p "$local_path"
+    "${RSYNC[@]}" -e "$RSYNC_SSH" "${REMOTE}:${remote_path}/" "${local_path}/"
+    echo "✓ synced ${remote_path} → ${local_path}"
+}
 
-#### 3.3 glibc 兼容性规则
+echo "=== Sync sysroot from ${REMOTE} ==="
+sync_path /lib/aarch64-linux-gnu  "${SYSROOT_DIR}/lib/aarch64-linux-gnu"
+sync_path /lib                      "${SYSROOT_DIR}/lib"
+sync_path /usr/lib/aarch64-linux-gnu  "${SYSROOT_DIR}/usr/lib/aarch64-linux-gnu"
+sync_path /usr/lib                    "${SYSROOT_DIR}/usr/lib"
 
-交叉编译动态链接程序时：
+# 按需追加头文件（示例）
+# sync_path /usr/include/rknn       "${SYSROOT_DIR}/usr/include/rknn"
 
-- 构建环境 glibc 版本 **必须 ≤ 目标机** glibc（旧 glibc 编出的二进制可在新系统跑）
-- `FROM` 应锁定指纹中 `VERSION_ID` 对应的官方镜像（如 `ubuntu:20.04`、`debian:11`）
-- 禁止 `FROM ubuntu:latest`
-
-#### 3.4 专有库处理（精准同步）
-
-优先级：
-
-1. **厂商 deb/SDK**（Rockchip `rknn-toolkit2`、板厂提供的 `.deb`）
-2. **目标机精准 rsync**（仅库文件与头文件，非全系统）：
-
-```text
-# 在开发机执行 — 仅同步单个库及其符号链接
-rsync -avz user@<board-ip>:/usr/lib/aarch64-linux-gnu/librknnrt.so* ./sysroot/vendor/lib/
-rsync -avz user@<board-ip>:/usr/include/rknn/ ./sysroot/vendor/include/rknn/
+echo "=== Sysroot ready: ${SYSROOT_DIR} ==="
+find "${SYSROOT_DIR}" -name '*.so*' | wc -l | xargs -I{} echo "  shared objects: {}"
 ```
 
-3. 在 `docs/target-sysroot-manifest.md` 记录来源路径、版本、同步日期
+#### 2.3 单库补齐（ldd 报错后的唯一修复路径）
 
-**禁止**：`rsync -avz user@board:/ ./sysroot/` 全量同步 rootfs。
+`ldd` 出现 `not found` 时，**不得**在 Dockerfile 中 `apt install`，而应：
+
+1. 在板上定位库：`find /usr /lib -name 'libXXX.so*' 2>/dev/null`
+2. 追加精准 rsync（示例）：
+
+```bash
+rsync -avz -e "ssh -b <板卡网卡IP>" \
+    root@<board-ip>:/usr/lib/aarch64-linux-gnu/libmissing.so* \
+    ./sysroot/usr/lib/aarch64-linux-gnu/
+```
+
+3. 记录到 `docs/target-sysroot-manifest.md`（库名、板上路径、同步日期）
+4. 重新构建 Docker 镜像并再上板 `ldd`
 
 ---
 
-### 阶段 4 — Dockerfile 结构（推荐多阶段）
+### 阶段 3 — 镜像集成：Dockerfile
 
-在指纹分析表经用户确认后，生成 Dockerfile。推荐结构：
+**严禁**在 Dockerfile 中 `apt install` ARM64 运行库。Sysroot 通过 `COPY` 植入。
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-# 由环境指纹生成 — 请勿手动改 FROM 版本
-# 指纹来源：<日期> / <板子 IP> / <镜像版本>
-FROM ubuntu:20.04 AS sysroot-base
+# Sysroot 来源：scripts/sync_sysroot.sh @ <日期>
+# 板型：RK3568 / <发行版>
+FROM ubuntu:20.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # 以下列表来自 ldd → apt 映射表
-    libstdc++6 \
-    <其它运行时包> \
-    && rm -rf /var/lib/apt/lists/*
 
-# 构建阶段
-FROM sysroot-base AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 仅安装宿主机架构交叉工具链 — 禁止 :arm64 包
+RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     gcc-aarch64-linux-gnu \
     g++-aarch64-linux-gnu \
-    <:-dev 包> \
+    binutils-aarch64-linux-gnu \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# 厂商库（若有）— 从精准 rsync 的 sysroot/vendor 拷贝
-COPY sysroot/vendor/ /usr/aarch64-linux-gnu/
+# 植入板端同步的 sysroot — 唯一运行时库来源
+COPY ./sysroot /usr/aarch64-linux-gnu
+
+ENV CMAKE_SYSROOT=/usr/aarch64-linux-gnu
 
 WORKDIR /src
 COPY . .
 
-# 使用 toolchain 文件，CMAKE_FIND_ROOT_PATH 指向 vendor
 RUN cmake -S . -B build \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake \
+    -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
     -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build
-
-# 可选：输出阶段仅拷贝产物
-FROM scratch AS export
-COPY --from=builder /src/build/<your_executable> /
 ```
 
-**CMake toolchain 要点**（`cmake/toolchain-aarch64.cmake`）：
+#### 3.1 环境变量（Dockerfile 必须显式定义）
+
+```dockerfile
+ENV CMAKE_SYSROOT=/usr/aarch64-linux-gnu
+```
+
+#### 3.2 CMake toolchain 要点（`cmake/toolchain-aarch64.cmake`）
 
 ```cmake
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
 set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
-set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu ${CMAKE_CURRENT_LIST_DIR}/../sysroot/vendor)
+
+set(CMAKE_SYSROOT /usr/aarch64-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu)
+
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+```
+
+**构建时必须显式传入**：
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake \
+  -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu
+```
+
+`CMAKE_FIND_ROOT_PATH` 确保编译器与链接器**只**在 sysroot 内查找库与头文件，屏蔽宿主机 `/usr/lib/x86_64-linux-gnu` 干扰。
+
+---
+
+### 阶段 4 — 构建
+
+```bash
+# 宿主机直接构建（sysroot 已同步到 ./sysroot）
+cmake -S . -B build-arm \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake \
+  -DCMAKE_SYSROOT="${PWD}/sysroot" \
+  -DCMAKE_FIND_ROOT_PATH="${PWD}/sysroot" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-arm
+
+# 或 Docker 构建（推荐可复现）
+docker build -t project-arm-builder .
+docker create --name arm-build project-arm-builder
+docker cp arm-build:/src/build/<your_executable> ./build-arm/
+docker rm arm-build
 ```
 
 ---
 
-### 阶段 5 — 闭环再验证
+### 阶段 5 — 闭环验证
 
-容器内编译产物必须再次上板验证：
+```bash
+# 1. 传输至目标机（走板卡直连网卡）
+scp -o BindAddress=<板卡网卡IP> build-arm/<your_executable> root@<board-ip>:/tmp/
 
-```text
-1. 从容器拷贝二进制：docker cp <container>:/src/build/<exe> .
-2. scp 到目标机
-3. 目标机再次执行：ldd ./<exe>
-4. 确认：无 not found；必要时实际运行并检查退出码/日志
+# 2. 板上 ldd 校验 — 必须无 not found
+ssh -b <板卡网卡IP> root@<board-ip> "ldd /tmp/<your_executable>"
+
+# 3. （可选）实际运行
+ssh -b <板卡网卡IP> root@<board-ip> "/tmp/<your_executable> --help"
 ```
 
-**Agent 完成条件**：用户粘贴「再验证」的 `ldd` 输出且无 `not found`，方可宣称环境就绪。
+**Agent 完成条件**：用户粘贴 `ldd` 输出且无 `not found`，方可宣称环境就绪。
+
+若仍有 `not found` → 回到 **§2.3 单库补齐**，禁止尝试 Dockerfile apt 修复。
 
 ---
 
-## 4. Agent 引导规则（摘要）
+## 5. Agent 硬性规则
 
-| 规则 | 行为 |
-|------|------|
-| 禁止凭空生成 | 无指纹 → 拒绝 Dockerfile，输出 §2 阶段 2 采集指令 |
-| 先分析后生成 | 必须先输出指纹解析表，用户确认后再给 Dockerfile |
-| 差异诊断 | 逐项列出 `not found`，映射到 apt 或 vendor 方案 |
-| 精准同步 | 专有库只 rsync 单路径；记录到 manifest |
-| 与 Grill 衔接 | 新模块涉及新 `.so` 依赖 → 重新走阶段 1–5 |
-| 与 TDD 衔接 | 业务代码仍走 TDD；环境搭建走本 Skill |
+| # | 规则 | 行为 |
+|---|------|------|
+| 1 | 工具链/运行库分离 | apt 只装交叉编译器；ARM64 库只来自 rsync sysroot |
+| 2 | 禁止 Dockerfile apt 装 ARM64 库 | 不得 `apt install lib*:arm64` 或同架构运行库替代 sysroot |
+| 3 | 国内源前置 | 任何 apt 操作前必须先 sed 替换国内镜像源 |
+| 4 | Sysroot 精准同步 | 禁止全量 rootfs；只同步 `.so*`、链接器、符号链接、按需头文件 |
+| 5 | 环境变量显式 | Dockerfile 必须 `ENV CMAKE_SYSROOT=...`；CMake 必须 `-DCMAKE_FIND_ROOT_PATH=...` |
+| 6 | ldd 驱动补齐 | `not found` → `sync_sysroot.sh` 单库 rsync，记录 manifest |
+| 7 | 先共识后生成 | 无板卡 IP/架构/网卡信息 → 拒绝 Dockerfile，引导 Grill |
+| 8 | 与 TDD 衔接 | 环境走本 Skill；业务代码走 TDD |
 
 ---
 
-## 5. 环境指纹存档模板
+## 6. 环境指纹（验证用，非 Dockerfile 前置阻塞）
 
-建议在项目中维护 `docs/target-fingerprint.md`（由 Agent 根据用户粘贴内容填写）：
+Sysroot 来自板端后，Dockerfile 可生成；但仍建议采集指纹用于 **glibc 版本存档** 与 **ldd 对比**：
 
-```markdown
-# 目标机环境指纹
-
-- 采集日期：
-- 板型：RK3568 / ...
-- IP：
-- 镜像：
-
-## uname -a
-（粘贴）
-
-## /etc/os-release
-（粘贴）
-
-## GLIBC
-（粘贴）
-
-## ldd --version
-（粘贴）
-
-## ldd <executable>（首次）
-（粘贴）
-
-## ldd <executable>（Docker 重编后）
-（粘贴）
-
-## apt 包映射结论
-| .so | apt 包 | 状态 |
-|-----|--------|------|
-
-## 厂商库 manifest
-| 库名 | 目标机路径 | 同步到 | 来源 |
-|------|-----------|--------|------|
+```bash
+uname -a
+cat /etc/os-release
+ldd --version | head -1
+file /tmp/<your_executable>
+readelf -l /tmp/<your_executable> | grep -i interpreter
+ldd /tmp/<your_executable>
 ```
 
----
-
-## 6. 常见问题诊断
-
-| 症状 | 可能原因 | Agent 应建议 |
-|------|----------|-------------|
-| `GLIBC_x.xx not found` | 构建机 glibc 太新 | 降低 `FROM` 版本或在旧容器内编译 |
-| `libstdc++.so.6: version GLIBCXX_x.xx not found` | g++ 版本高于目标机 | 容器内安装匹配版本的 `libstdc++6`，或 pin g++ 版本 |
-| `No such file or directory`（文件存在） | 动态链接器路径错误 | 检查 `readelf -l` interpreter 与 sysroot |
-| `not found` 厂商库 | 未同步 vendor lib | rsync 单库 + `LD_LIBRARY_PATH` 或 rpath |
-| 容器内编译通过、板上 segfault | ABI/编译选项不一致 | 对比 `file`、`readelf -A`、`-march` 标志 |
+建议在 `docs/target-fingerprint.md` 存档；`docs/target-sysroot-manifest.md` 记录每次 rsync 与单库补齐。
 
 ---
 
-## 7. 与 RK3568 相关的补充
+## 7. 常见问题诊断
 
-- **优先查阅**：板厂/瑞芯微提供的 prebuilt toolchain 或 Docker 镜像（若与指纹一致，可替代自建 Dockerfile，但仍需 `ldd` 验证）
-- **NPU/RGA 类库**：几乎从不在标准 apt 中，必须走 vendor SDK 或 rsync
-- **I2C/GPIO 用户态**：通常 `libi2c0`、`libgpiod2`；在目标机 `dpkg -S` 确认
-- **交叉编译主机测试**：业务逻辑用 Fake 硬件跑 `ctest`；集成测试仍须上板
-
----
-
-## 8. 简化路径：静态链接（可选）
-
-若程序无厂商动态库依赖，可 Grill 时评估 **musl 静态链接**：
-
-- 优点：不依赖目标 glibc 版本，Docker 更简单
-- 缺点：体积大；某些库（glibc 特有、厂商 .so）无法静态
-- 流程：仍可先 `ldd` 确认「静态」；`file` 应显示 `statically linked`
-
-仅在用户明确同意且 `ldd` 证明无动态依赖时，可跳过 glibc 匹配，但仍建议保留指纹存档。
+| 症状 | 可能原因 | 修复 |
+|------|----------|------|
+| Docker 构建找错库路径 | 未设 `CMAKE_FIND_ROOT_PATH` | 显式 `-DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu` |
+| 链接阶段引用 x86_64 库 | `FIND_ROOT_PATH_MODE` 未设 ONLY | 检查 toolchain 四项 MODE |
+| `GLIBC_x.xx not found` | sysroot 与板端不一致 | 重新 `sync_sysroot.sh` 全量同步 lib 目录 |
+| `libstdc++.so.6: GLIBCXX_x.xx not found` | sysroot 中 libstdc++ 过旧 | 从板上 re-sync `/usr/lib/aarch64-linux-gnu/libstdc++*` |
+| `not found` 厂商库 | sysroot 未含 vendor .so | §2.3 单库 rsync |
+| apt 装 `:arm64` 后仍 ldd 失败 | 库版本/路径与板端漂移 | **放弃 apt 方案**，改 rsync |
+| rsync 连不上板子 | 流量走外网网卡 | `ssh -b <板卡网卡IP>` / 检查直连路由 |
+| 容器内编译通过、板上 segfault | ABI/`-march` 不一致 | 对比 `file`、`readelf -A` |
 
 ---
 
-## 9. 文件清单
+## 8. RK3568 补充
+
+- **NPU/RGA/Mali 类库**：不在标准 apt 中，随 sysroot 从板端同步或 §2.3 单库补齐
+- **I2C/GPIO 用户态**：`libi2c.so`、`libgpiod.so` 等在 `/usr/lib/aarch64-linux-gnu/`，随 sysroot 同步即可
+- **板厂 prebuilt toolchain**：若与板上 glibc 一致且已含匹配 sysroot，可替代自建，但仍须 `ldd` 验证
+- **交叉编译主机测试**：业务逻辑用 Fake 硬件跑 `ctest`；集成测试须上板
+
+---
+
+## 9. 简化路径：静态链接（可选）
+
+无厂商动态库依赖时可 Grill 评估 **musl 静态链接**：
+
+- 优点：不依赖 sysroot/glibc 匹配
+- 缺点：体积大；厂商 .so 无法静态
+- 仅在用户明确同意且 `ldd` 证明无动态依赖时适用
+
+---
+
+## 10. 文件清单
 
 | 文件 | 用途 |
 |------|------|
-| `EMBEDDED_CROSS_COMPILE_SKILL.md` | 本 Skill（完整流程） |
-| `PROMPT_CROSS_COMPILE.md` | 用户触发 `/cross-env` 的提示词模板 |
-| `docs/target-fingerprint.md` | 项目内指纹存档（运行时创建） |
-| `docs/target-sysroot-manifest.md` | 厂商库同步记录（运行时创建） |
+| `EMBEDDED_CROSS_COMPILE_SKILL.md` | 本 Skill |
+| `PROMPT_CROSS_COMPILE.md` | `/cross-env` 提示词模板 |
+| `scripts/sync_sysroot.sh` | 板端 → 宿主机 sysroot 同步（目标项目中创建） |
+| `sysroot/` | rsync 产物（gitignore，不入库） |
+| `docs/target-fingerprint.md` | 环境指纹存档 |
+| `docs/target-sysroot-manifest.md` | sysroot 同步与单库补齐记录 |
 | `cmake/toolchain-aarch64.cmake` | 交叉编译 toolchain |
-| `Dockerfile` | 指纹确认后生成 |
+| `Dockerfile` | 共识 + sysroot 就绪后生成 |
 
 ---
 
-## 10. 与 C++ 工程工作流的关系
+## 11. 与 C++ 工程工作流的关系
 
 ```text
 嵌入式新功能：
-  Grill（含硬件/部署共识）
+  Grill（含网卡/板卡 IP 共识）
     → [若需新构建环境] 本 Skill 阶段 1–5
     → TDD 垂直切片（主机 Fake 测试 + 板上集成验证）
-    → 部署 scp + 板上 ldd/运行确认
+    → scp 部署 + 板上 ldd/运行确认
 ```

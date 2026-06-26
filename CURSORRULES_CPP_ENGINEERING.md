@@ -130,41 +130,32 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 ## 嵌入式交叉编译（RK3568 等）
 
-针对 Embedded Linux 目标机的用户态开发，遵循 **观测-验证-构建** 流程（详见 `EMBEDDED_CROSS_COMPILE_SKILL.md`）。
+针对 Embedded Linux 目标机，遵循 **环境解耦与二进制对齐** 流程（详见 `EMBEDDED_CROSS_COMPILE_SKILL.md`）。典型环境：双网卡宿主机 — 外网装工具链，直连网卡 rsync/scp 开发板。
 
 ### 触发条件
 
-用户请求：Docker 构建环境、交叉编译、部署到 RK3568/ARM 板、解决 `ldd not found`。
+用户请求：Docker 构建环境、交叉编译、部署到 RK3568/ARM 板、解决 `ldd not found`、`sync_sysroot`。
 
 ### 强制 Pipeline
 
 ```text
-Grill 共识 → 基准交叉编译 → scp 上板 → 目标机采集环境指纹 → 指纹解析表 → Dockerfile → 容器重编 → 再上板 ldd 验证
+Grill 共识 → ① 联网 apt 装交叉工具链(国内源) → ② rsync sync_sysroot → ③ Docker COPY sysroot → CMake 构建 → 上板 ldd 验证
 ```
 
 ### Agent 硬性规则
 
-1. **禁止凭空生成 Dockerfile**：用户未提供目标机 `uname -a`、`/etc/os-release`、`ldd --version`、`ldd ./<executable>` 输出时，**拒绝编写 Dockerfile**，并引导用户执行指纹采集命令。
-2. **先解析后生成**：收到指纹后，必须先输出指纹解析表（DISTRO、GLIBC、apt 映射、`not found`、vendor 库），用户确认后再给 Dockerfile。
-3. **差异诊断**：逐项分析 `ldd` 中 `not found`，映射到 `apt-get install` 或 vendor/rsync 方案。
-4. **精准同步**：`librknn`、`librga` 等专有库优先官方 SDK/deb；否则 **rsync 单库路径**，禁止全量 rootfs 同步。记录到 `docs/target-sysroot-manifest.md`。
-5. **glibc 规则**：Docker `FROM` 锁定指纹中的发行版版本（如 `ubuntu:20.04`）；构建环境 glibc 版本必须 ≤ 目标机。
-6. **闭环验证**：容器产物必须再次 scp 上板，`ldd` 无 `not found` 后方可宣称环境就绪。
-
-### 目标机指纹采集命令（引导用户使用）
-
-```bash
-uname -a
-cat /etc/os-release
-ldd --version | head -1
-file /tmp/<your_executable>
-readelf -l /tmp/<your_executable> | grep -i interpreter
-ldd /tmp/<your_executable>
-```
+1. **工具链与运行库分离**：apt **仅**安装 `gcc-aarch64-linux-gnu` 等宿主机架构交叉编译器；**禁止** apt 安装 `:arm64` 运行库或试图用 apt 替代 sysroot。
+2. **国内源前置**：任何 apt 操作前必须先 sed 替换国内镜像源。
+3. **Sysroot 来自板端**：通过 `scripts/sync_sysroot.sh` 将板子 `/lib/`、`/usr/lib/` 同步至 `./sysroot`；禁止全量 rootfs 同步。
+4. **Dockerfile 只 COPY**：`COPY ./sysroot /usr/aarch64-linux-gnu`；必须 `ENV CMAKE_SYSROOT=/usr/aarch64-linux-gnu`；严禁 Dockerfile 内 apt 装 ARM64 库。
+5. **CMake 隔离宿主机**：构建时必须 `-DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu`，toolchain 设 `FIND_ROOT_PATH_MODE_*` 为 ONLY/NEVER。
+6. **ldd 驱动补齐**：`not found` 必须回溯到 `sync_sysroot.sh` 单库 rsync，**不得**尝试 Dockerfile apt 修复。记录到 `docs/target-sysroot-manifest.md`。
+7. **双网卡路由**：rsync/scp/ssh 走板卡直连网卡（`ssh -b <板卡网卡IP>`），禁止误走外网。
+8. **闭环验证**：产物 scp 上板，`ldd` 无 `not found` 后方可宣称环境就绪。
 
 ### 与 TDD 的分工
 
-- 环境搭建：本 Skill（观测-验证-构建）
+- 环境搭建：本 Skill（三阶段 Pipeline + ldd 闭环）
 - 业务代码：TDD 垂直切片（主机 Fake 测试 + 板上集成验证）
 
 ---
@@ -176,7 +167,7 @@ ldd /tmp/<your_executable>
 - 不在用户未要求时 git commit
 - 不跳过编译和测试直接宣称完成
 - 不在需求未共识时直接写大段实现
-- **不在无目标机环境指纹时生成 Dockerfile 或猜测 apt/sysroot 配置**
+- **不在无板卡 IP/架构/网卡共识时生成 Dockerfile；禁止用 apt 替代 rsync sysroot**
 
 ---
 
