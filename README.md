@@ -418,13 +418,40 @@ TEST(SensorReader, CallsI2cReadExactlyOnce) {  // 坏：测 HOW 不是 WHAT
 
 ---
 
-## 12. 文件清单
+## 12. 嵌入式交叉编译（RK3568 等）
+
+针对 Embedded Linux 目标机，在业务 TDD 之外，环境搭建走独立的 **观测-验证-构建** 流程：
+
+```text
+Grill 共识 → 基准编译 → scp 上板 → 目标机环境指纹 → 指纹解析表 → Dockerfile → 再上板 ldd 验证
+```
+
+| 原则 | 说明 |
+|------|------|
+| 禁止凭空 Docker | 无 `uname`/`os-release`/`ldd` 指纹 → 不写 Dockerfile |
+| 先解析后生成 | 必须先输出 apt 映射表与 `not found` 诊断 |
+| 精准同步 | 厂商库 rsync 单路径，不全量 rootfs |
+| glibc 匹配 | `FROM` 锁定目标发行版；构建 glibc ≤ 目标机 |
+
+完整流程见 **`EMBEDDED_CROSS_COMPILE_SKILL.md`**；日常触发用 **`PROMPT_CROSS_COMPILE.md`**（`/cross-env`）。
+
+与主工作流关系：
+
+```text
+嵌入式新功能：Grill → [可选 cross-env] → TDD → scp 部署 → 板上验证
+```
+
+---
+
+## 13. 文件清单
 
 本目录包含：
 
 | 文件 | 用途 |
 |------|------|
-| `C++_ENGINEERING_GUIDE.md` | 本指南（详细操作说明） |
+| `README.md` | 本指南（详细操作说明） |
 | `CURSORRULES_CPP_ENGINEERING.md` | 复制到 `.cursorrules` 的系统指令 |
 | `PROMPT_GRILL.md` | `/grill` 日常提示词模板 |
 | `PROMPT_TDD.md` | `/tdd` 日常提示词模板 |
+| `EMBEDDED_CROSS_COMPILE_SKILL.md` | 嵌入式交叉编译 Skill（观测-验证-构建） |
+| `PROMPT_CROSS_COMPILE.md` | `/cross-env` 提示词模板 |

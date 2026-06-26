@@ -25,6 +25,8 @@
 | Bug 报告 / 测试失败 | **诊断流程**（先建立失败反馈回路，再修复） |
 | 用户说 `/grill` 或「盘问一下需求」 | 进入 Grill 模式 |
 | 用户说 `/tdd` 或「测试驱动」 | 进入 TDD 模式（若需求未共识，先 Grill） |
+| 用户说 `/cross-env` 或请求 Docker/交叉编译环境 | 进入 **嵌入式交叉编译 Skill**（见下文） |
+| RK3568 等板子部署、scp、ldd 问题 | 嵌入式交叉编译 Skill 或 Bug 诊断 |
 
 ### 2. Grill 模式（需求盘问）
 
@@ -126,6 +128,47 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 ---
 
+## 嵌入式交叉编译（RK3568 等）
+
+针对 Embedded Linux 目标机的用户态开发，遵循 **观测-验证-构建** 流程（详见 `EMBEDDED_CROSS_COMPILE_SKILL.md`）。
+
+### 触发条件
+
+用户请求：Docker 构建环境、交叉编译、部署到 RK3568/ARM 板、解决 `ldd not found`。
+
+### 强制 Pipeline
+
+```text
+Grill 共识 → 基准交叉编译 → scp 上板 → 目标机采集环境指纹 → 指纹解析表 → Dockerfile → 容器重编 → 再上板 ldd 验证
+```
+
+### Agent 硬性规则
+
+1. **禁止凭空生成 Dockerfile**：用户未提供目标机 `uname -a`、`/etc/os-release`、`ldd --version`、`ldd ./<executable>` 输出时，**拒绝编写 Dockerfile**，并引导用户执行指纹采集命令。
+2. **先解析后生成**：收到指纹后，必须先输出指纹解析表（DISTRO、GLIBC、apt 映射、`not found`、vendor 库），用户确认后再给 Dockerfile。
+3. **差异诊断**：逐项分析 `ldd` 中 `not found`，映射到 `apt-get install` 或 vendor/rsync 方案。
+4. **精准同步**：`librknn`、`librga` 等专有库优先官方 SDK/deb；否则 **rsync 单库路径**，禁止全量 rootfs 同步。记录到 `docs/target-sysroot-manifest.md`。
+5. **glibc 规则**：Docker `FROM` 锁定指纹中的发行版版本（如 `ubuntu:20.04`）；构建环境 glibc 版本必须 ≤ 目标机。
+6. **闭环验证**：容器产物必须再次 scp 上板，`ldd` 无 `not found` 后方可宣称环境就绪。
+
+### 目标机指纹采集命令（引导用户使用）
+
+```bash
+uname -a
+cat /etc/os-release
+ldd --version | head -1
+file /tmp/<your_executable>
+readelf -l /tmp/<your_executable> | grep -i interpreter
+ldd /tmp/<your_executable>
+```
+
+### 与 TDD 的分工
+
+- 环境搭建：本 Skill（观测-验证-构建）
+- 业务代码：TDD 垂直切片（主机 Fake 测试 + 板上集成验证）
+
+---
+
 ## 禁止事项
 
 - 不生成 npm/Node/TypeScript 相关文件或命令
@@ -133,6 +176,7 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 - 不在用户未要求时 git commit
 - 不跳过编译和测试直接宣称完成
 - 不在需求未共识时直接写大段实现
+- **不在无目标机环境指纹时生成 Dockerfile 或猜测 apt/sysroot 配置**
 
 ---
 
